@@ -1,0 +1,14 @@
+# DocReviewer authorization
+#
+# This file authorizes the wallet address(es) listed below to register this
+# repository with DocReviewer and set its documentation rules.
+#
+# DocReviewer fetches this file from the repository's default branch at
+# registration time and checks that the registering wallet's address appears
+# here. Only a wallet with write access to this repository can add or change
+# this file, so it is the on-chain-verifiable proof that the registrant is
+# authorized by the repository.
+#
+# Add one address per line. Lines starting with # are ignored.
+
+0x61fd0047595A30A067f1F21F3b28C4AE8A8e3Dc3

@@ -14,12 +14,24 @@ and the evidence is independently checkable — every validator fetches the same
 document. The badge is a durable, consensus-derived credential that any other
 contract or application can query, so the on-chain artifact IS the value.
 
+Registration is gated on ON-CHAIN-VERIFIABLE AUTHORIZATION. First-claim-wins is
+not enough: it lets any wallet squat an arbitrary repo_id (e.g. "torvalds/linux")
+and then issue Verified Contributor badges under rules the real maintainer never
+approved. Instead, the repository itself must publish `AUTH_PATH` on its default
+branch naming the wallet that is registering it. The contract fetches that file
+and checks the registering wallet's address is present. Only a wallet with write
+access to the repository can add the file, so the proof is real — and it is
+re-derived from the repository on every registration, not asserted by the
+caller. This mirrors the evidence model used for submissions: the repository is
+the source, not the claimant.
+
 Consensus uses gl.vm.run_nondet with a leader/validator pair, one round per
 rule. The leader judges a rule against the fetched document; each validator
 INDEPENDENTLY fetches the same document and re-judges, agreeing only if it
 reproduces the leader's verdict. A leader that fabricates a verdict is caught
 when a validator's independent judgment disagrees. Each rule gets its own round,
-so one ambiguous rule does not deadlock the others.
+so one ambiguous rule does not deadlock the others. The authorization check uses
+the same leader/validator pattern over the authorization file.
 
 This deliberately does NOT use gl.eq_principle.strict_eq over an LLM output:
 strict_eq does not enforce cross-validator equality for non-deterministic
@@ -40,6 +52,12 @@ from datetime import datetime, timezone
 
 from genlayer import *
 
+# The repository publishes this file on its default branch to authorize the
+# wallet(s) that may register it. It is the on-chain-verifiable proof of
+# authorization: only a wallet with write access to the repository can add it.
+AUTH_PATH = ".docreviewer"
+AUTH_HOST = "https://raw.githubusercontent.com"
+
 
 def _extract_text(raw_html: str) -> str:
     text = re.sub(r"<script[^>]*>.*?</script>", "", raw_html, flags=re.DOTALL | re.IGNORECASE)
@@ -51,12 +69,16 @@ def _extract_text(raw_html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _fetch_doc(url: str) -> str:
+def _fetch_raw(url: str) -> str:
+    """Fetch a URL and return the raw body (for plain-text / JSON files)."""
     response = gl.nondet.web.request(url, method="GET")
     body = response.body if hasattr(response, "body") else (
         response.get("body", "") if isinstance(response, dict) else str(response))
-    raw = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-    return _extract_text(raw)[:6000]
+    return body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+
+
+def _fetch_doc(url: str) -> str:
+    return _extract_text(_fetch_raw(url))[:6000]
 
 
 def _parse_verdict(raw: str) -> str:
@@ -130,6 +152,35 @@ class DocReviewer(gl.Contract):
     def _now(self) -> int:
         return int(datetime.now(timezone.utc).timestamp())
 
+    def _auth_url(self, repo_id: str) -> str:
+        return f"{AUTH_HOST}/{repo_id}/HEAD/{AUTH_PATH}"
+
+    def _is_authorized(self, repo_id: str, wallet: str) -> bool:
+        """On-chain-verifiable authorization for registering `repo_id`.
+
+        The repository must publish AUTH_PATH on its default branch naming the
+        registering wallet. The contract fetches that file (leader/validator
+        consensus) and checks the wallet address is present. Only a wallet with
+        write access to the repository can add the file, so a wallet cannot
+        claim an arbitrary repo_id it does not control.
+        """
+        url = self._auth_url(repo_id)
+        target = str(wallet).lower()
+
+        def leader_fn() -> dict:
+            raw = _fetch_raw(url).lower()
+            return {"authorized": target in raw}
+
+        def validator_fn(leader_res) -> bool:
+            if not isinstance(leader_res, gl.vm.Return):
+                return False
+            mine = target in _fetch_raw(url).lower()
+            return mine == bool(leader_res.calldata.get("authorized"))
+
+        result = gl.vm.run_nondet(leader_fn, validator_fn)
+        data = result.calldata if hasattr(result, "calldata") else result
+        return bool(data.get("authorized"))
+
     def _consensus_one(self, target_url: str, rule: str) -> str:
         """One independent leader/validator round for one rule."""
         url = target_url
@@ -153,27 +204,40 @@ class DocReviewer(gl.Contract):
     def register_repo(self, repo_id: str, rules: DynArray[str]) -> str:
         """Claim a repo_id and set its documentation rules.
 
-        First registration wins: a repo_id can only ever be claimed once, by
-        one wallet. This prevents a bad actor from pre-registering someone
-        else's repository (e.g. "torvalds/linux") with trivial rules and
-        issuing Verified Contributor badges the real maintainer never
-        authorised. The claiming wallet is the sole authority for that repo.
+        Registration is gated on on-chain-verifiable authorization: the
+        repository must publish AUTH_PATH on its default branch naming the
+        registering wallet. The contract fetches that file and checks the
+        wallet address is present. A wallet that cannot write to the repository
+        cannot register it, so no one can squat a namespace (e.g.
+        "torvalds/linux") and issue badges under rules the real maintainer never
+        approved.
         """
+        repo_id = str(repo_id).strip()
         if not repo_id:
             raise gl.vm.UserError("repo_id required")
+        if repo_id.count("/") != 1 or repo_id.startswith("/") or repo_id.endswith("/"):
+            raise gl.vm.UserError("repo_id must be owner/repo")
         if self.repo_rules.get(repo_id, None) is not None:
             raise gl.vm.UserError(
                 f"Repository {repo_id} already claimed by {self.repo_owner[repo_id]}")
         if len(rules) == 0:
             raise gl.vm.UserError("at least one rule required")
-        self.repo_owner[repo_id] = str(gl.message.sender_address)
+
+        sender = str(gl.message.sender_address)
+        if not self._is_authorized(repo_id, sender):
+            raise gl.vm.UserError(
+                f"Wallet {sender} is not authorized by {repo_id}. Publish the "
+                f"wallet address in {AUTH_PATH} on the repository's default "
+                f"branch, then retry.")
+
+        self.repo_owner[repo_id] = sender
         self.repo_rules[repo_id] = json.dumps(list(rules))
         self.repo_count += u256(1)
         return f"REGISTERED {len(rules)} rules"
 
     @gl.public.write
     def update_rules(self, repo_id: str, rules: DynArray[str]) -> str:
-        """Replace a repo's rules. Only the wallet that claimed the repo may
+        """Replace a repo's rules. Only the wallet that registered the repo may
         call this. Existing badges are unaffected — they were earned against
         the rules in force at the time of the verified submission."""
         repo_id = str(repo_id)
@@ -191,6 +255,16 @@ class DocReviewer(gl.Contract):
         if self.repo_rules.get(str(repo_id), None) is None:
             return u256(0)
         return u256(1) if str(wallet) == self.repo_owner[str(repo_id)] else u256(0)
+
+    @gl.public.view
+    def auth_path(self) -> str:
+        """The path a repository publishes to authorize a registering wallet."""
+        return AUTH_PATH
+
+    @gl.public.view
+    def auth_url(self, repo_id: str) -> str:
+        """The exact URL the contract fetches to check authorization."""
+        return self._auth_url(str(repo_id))
 
     @gl.public.write
     def submit_doc(self, submission_id: str, repo_id: str, doc_url: str) -> str:
