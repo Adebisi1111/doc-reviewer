@@ -9,6 +9,14 @@ every rule is satisfied, the contributor's wallet receives a permanent
 **Deployed on Bradbury (chain 4221):** `0x3Ea639139d34830CD88f3dA41369D9F52D1eAd01`
 **Explorer:** https://explorer-bradbury.genlayer.com/address/0x3Ea639139d34830CD88f3dA41369D9F52D1eAd01
 
+**Deployed source == published source.** `genlayer-js getContractCode` on the
+address returns the contract source from the chain; its sha256 matches
+`contracts/doc_reviewer.py` in this repo:
+
+```
+on-chain / repo sha256: 8664d6f8f25649cf89c721df29b0793c65d68d9f447c2e9b75039a6f37759bbe  (16063 bytes)
+```
+
 ---
 
 ## What it does
