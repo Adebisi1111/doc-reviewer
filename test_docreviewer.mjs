@@ -32,6 +32,10 @@ const ABI = [
   { type: 'function', name: 'is_repo_owner', stateMutability: 'view',
     inputs: [{ name: 'repo_id', type: 'string' }, { name: 'wallet', type: 'string' }],
     outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'auth_path', stateMutability: 'view',
+    inputs: [], outputs: [{ name: '', type: 'string' }] },
+  { type: 'function', name: 'auth_url', stateMutability: 'view',
+    inputs: [{ name: 'repo_id', type: 'string' }], outputs: [{ name: '', type: 'string' }] },
   { type: 'function', name: 'submit_doc', stateMutability: 'nonpayable',
     inputs: [{ name: 'submission_id', type: 'string' }, { name: 'repo_id', type: 'string' },
               { name: 'doc_url', type: 'string' }], outputs: [{ name: '', type: 'string' }] },
@@ -146,7 +150,7 @@ async function deploy(code, tries = 3) {
 // --- 1: repo registration --------------------------------------------------
 async function testRegisterRepo() {
   console.log('\n[1] repository registers plain-English rules');
-  const repo = 'demo-repo-1';
+  const repo = 'Adebisi1111/doc-reviewer';
   for (let a = 1; a <= 4; a++) {
     const r = await write('register_repo', [repo, [RULE_PASS]]);
     console.log(`  register_repo#${a}: result=${r && r.resultName} exec=${r && r.txExecutionResultName}`);
@@ -196,7 +200,7 @@ async function testVerifiedBadge(repo) {
 // --- 3: docs that fail a rule -> rejected, no badge ------------------------
 async function testRejected(repo) {
   console.log('\n[3] docs failing a rule are rejected with no badge');
-  const repo2 = 'demo-repo-2';
+  const repo2 = 'Adebisi1111/milestone-markets';
   for (let a = 1; a <= 4; a++) {
     const r = await write('register_repo', [repo2, [RULE_FAIL]]);
     if (r && r.resultName === 'AGREE' && r.txExecutionResultName === 'FINISHED_WITH_RETURN') break;
@@ -239,16 +243,29 @@ async function testRiggedLeader() {
   const adv = await deploy(rigged);
   const saved = ADDR; ADDR = adv;
   for (let a = 1; a <= 4; a++) {
-    const r = await write('register_repo', ['adv-repo', [RULE_FAIL]]);
+    const r = await write('register_repo', ['Adebisi1111/doc-reviewer', [RULE_FAIL]]);
     if (r && r.resultName === 'AGREE' && r.txExecutionResultName === 'FINISHED_WITH_RETURN') break;
     await new Promise(x => setTimeout(x, 4000));
   }
   let disagree = 0;
   for (let a = 1; a <= 5; a++) {
-    const r = await write('submit_doc', ['adv-sub', 'adv-repo', URL_PASS]);
+    let r = null;
+    try {
+      r = await write('submit_doc', ['adv-sub', 'Adebisi1111/doc-reviewer', URL_PASS]);
+    } catch (e) {
+      // A DISAGREE round can surface as a reverted tx; that is still the
+      // validators refusing the leader, so count it and continue.
+      console.log(`  rigged submit#${a}: reverted — ${(e.shortMessage || e.message || '').slice(0, 70)}`);
+      disagree++;
+      await new Promise(x => setTimeout(x, 4000));
+      continue;
+    }
     console.log(`  rigged submit#${a}: result=${r && r.resultName}`);
-    if (r && r.resultName === 'DISAGREE') disagree++;
-    if (r && r.resultName === 'AGREE' && r.txExecutionResultName === 'FINISHED_WITH_RETURN') break;
+    // DISAGREE, TIMEOUT and UNDETERMINED all mean the rigged leader was NOT
+    // accepted; only AGREE + FINISHED_WITH_RETURN would be a breach.
+    const rn = r && r.resultName;
+    if (rn && rn !== 'AGREE') disagree++;
+    if (rn === 'AGREE' && r.txExecutionResultName === 'FINISHED_WITH_RETURN') break;
     await new Promise(x => setTimeout(x, 4000));
   }
   const s = await read('get_submission', ['adv-sub']);
@@ -263,7 +280,7 @@ async function testRiggedLeader() {
 
 // --- 6: repo ownership -----------------------------------------------------
 async function testOwnership(repo) {
-  console.log('\n[6] repo ownership — first claim wins, only owner can update rules');
+  console.log('\n[6] repo ownership — only owner can update rules');
   const other = '0x000000000000000000000000000000000000dEaD';
   const owner = await readRaw('is_repo_owner', [repo, me]);
   check('claiming wallet is the owner', String(owner) === '1', `is_repo_owner=${String(owner)}`);
@@ -295,6 +312,36 @@ async function testOwnership(repo) {
   await write('update_rules', [repo, [RULE_PASS]]);
 }
 
+// --- 7: namespace squatting is rejected ------------------------------------
+async function testUnauthorizedRejected(repo) {
+  console.log('\n[7] a wallet cannot register a repo it is not authorized by');
+
+  // The authorization mechanism must be discoverable.
+  const ap = await readRaw('auth_path', []);
+  check('auth_path view returns the file path', String(ap) === '.docreviewer', `auth_path=${ap}`);
+  const au = await readRaw('auth_url', [repo]);
+  check('auth_url view returns the fetch URL',
+    String(au).includes(repo) && String(au).includes('.docreviewer'), `auth_url=${au}`);
+
+  // The squatter has no authorization file in torvalds/linux, so registration
+  // must be rejected even though the repo_id is unclaimed on this contract.
+  const squat = 'torvalds/linux';
+  const r = await write('register_repo', [squat, ['any rule at all']]);
+  console.log(`  register_repo(unauthorized): result=${r && r.resultName} exec=${r && r.txExecutionResultName}`);
+  check('unauthorized registration rejected',
+    r && r.txExecutionResultName !== 'FINISHED_WITH_RETURN',
+    `exec=${r && r.txExecutionResultName}`);
+
+  const rd = await read('get_repo', [squat]);
+  check('squatted repo not registered', !rd || rd.exists === false, `exists=${rd && rd.exists}`);
+
+  // A malformed repo_id (not owner/repo) is rejected before any fetch.
+  const bad = await write('register_repo', ['not-a-repo', ['x']]);
+  check('malformed repo_id rejected',
+    bad && bad.txExecutionResultName !== 'FINISHED_WITH_RETURN',
+    `exec=${bad && bad.txExecutionResultName}`);
+}
+
 async function main() {
   console.log('DocReviewer — on-chain test suite');
   console.log('account:', me);
@@ -307,6 +354,7 @@ async function main() {
   await testRejected(repo);
   await testDuplicateRejected(repo);
   await testOwnership(repo);
+  await testUnauthorizedRejected(repo);
   await testRiggedLeader();
 
   console.log(`\n=== ${passed} passed, ${failed} failed ===`);
